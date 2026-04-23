@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<html lang="zh-TW"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>泰國工業園區綜合比較｜繁體中文版</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --sage: #7C9A7E;
+    --sage-light: #A8C5A0;
+    --sage-dark: #4A6B4C;
+    --cream: #FAF7F2;
+    --warm-white: #FFFFFF;
+    --sand: #EDE8DF;
+    --sand-dark: #D6CFC2;
+    --stone: #8C8278;
+    --stone-dark: #5A544E;
+    --charcoal: #2D2926;
+    --tfd-color: #1B4F72;
+    --tfd-light: #D6E8F7;
+    --tfd-accent: #2E86C1;
+    --amata-color: #1E6B3C;
+    --amata-light: #D5F0DC;
+    --amata-accent: #27AE60;
+    --bftz-color: #7D3C0F;
+    --bftz-light: #FAE5D3;
+    --bftz-accent: #E67E22;
+    --pro-green: #1B5E20;
+    --con-red: #B71C1C;
+    --shadow-soft: 0 4px 24px rgba(44,41,38,0.08);
+    --shadow-card: 0 2px 12px rgba(44,41,38,0.06);
+    --radius: 16px;
+    --radius-sm: 10px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Noto Sans TC', 'PingFang TC', 'Microsoft JhengHei', sans-serif;
+    background: var(--cream);
+    color: var(--charcoal);
+    font-size: 15px;
+    line-height: 1.75;
+  }
+
+  /* ── HERO ── */
+  .hero {
+    background: linear-gradient(135deg, #1A3A2B 0%, #2D5E3F 40%, #3D7A52 70%, #6A9B72 100%);
+    padding: 60px 24px 48px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+  .hero::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.04'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+  }
+  .hero-badge {
+    display: inline-block;
+    background: rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.9);
+    font-size: 12px; font-weight: 500;
+    padding: 5px 18px; border-radius: 100px;
+    border: 1px solid rgba(255,255,255,0.28);
+    margin-bottom: 20px; letter-spacing: 2px;
+  }
+  .hero h1 {
+    font-size: clamp(21px, 4vw, 33px);
+    font-weight: 800; color: #fff;
+    margin-bottom: 10px; line-height: 1.35;
+  }
+  .hero p { color: rgba(255,255,255,0.82); font-size: 14px; font-weight: 300; max-width: 560px; margin: 0 auto 28px; }
+  .park-chips { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+  .park-chip {
+    background: rgba(255,255,255,0.18);
+    border: 1px solid rgba(255,255,255,0.32);
+    color: #fff; padding: 7px 18px; border-radius: 100px;
+    font-size: 13px; font-weight: 600; backdrop-filter: blur(6px);
+  }
+
+  /* ── DOWNLOAD BAR ── */
+  .download-bar {
+    background: #fff8f0;
+    border-bottom: 1.5px solid #f0d9b5;
+    padding: 10px 24px;
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 10px;
+  }
+  .download-bar-text {
+    font-size: 13px; color: #7D3C0F; font-weight: 500;
+    display: flex; align-items: center; gap: 7px;
+  }
+  .download-btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+  .dl-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 16px; border-radius: 8px; font-size: 13px;
+    font-weight: 700; cursor: pointer; border: none;
+    font-family: inherit; text-decoration: none;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  .dl-btn:hover { opacity: 0.88; transform: translateY(-1px); }
+  .dl-btn:active { transform: translateY(0); }
+  .dl-btn.primary { background: #1E6B3C; color: #fff; }
+  .dl-btn.secondary { background: #1B4F72; color: #fff; }
+
+  /* ── LAYOUT ── */
+  .container { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+  .section { padding: 40px 0 20px; }
+  .section-title {
+    font-size: 18px; font-weight: 700; color: var(--sage-dark);
+    margin-bottom: 20px; display: flex; align-items: center; gap: 10px;
+  }
+  .section-title span.num {
+    background: var(--sage-dark); color: #fff;
+    width: 32px; height: 32px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; flex-shrink: 0;
+  }
+  hr.divider { border: none; border-top: 1.5px solid var(--sand-dark); margin: 8px 0 20px; }
+
+  /* ── PARK CARDS ── */
+  .park-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+  .park-card {
+    background: var(--warm-white); border-radius: var(--radius);
+    box-shadow: var(--shadow-card); overflow: hidden;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .park-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-soft); }
+  .park-card-header { padding: 18px 20px 14px; display: flex; align-items: flex-start; gap: 12px; }
+  .park-icon { width: 46px; height: 46px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0; }
+  .tfd .park-icon { background: var(--tfd-light); }
+  .amata .park-icon { background: var(--amata-light); }
+  .bftz .park-icon { background: var(--bftz-light); }
+  .park-card-name { font-size: 15px; font-weight: 700; }
+  .park-card-sub { font-size: 12px; color: var(--stone); margin-top: 2px; }
+  .tfd .park-card-name { color: var(--tfd-color); }
+  .amata .park-card-name { color: var(--amata-color); }
+  .bftz .park-card-name { color: var(--bftz-color); }
+  .park-card-body { padding: 4px 20px 18px; }
+  .info-row {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding: 7px 0; border-bottom: 1px solid var(--sand);
+    font-size: 13px; gap: 12px;
+  }
+  .info-row:last-child { border-bottom: none; }
+  .info-label { color: var(--stone); font-weight: 500; white-space: nowrap; flex-shrink: 0; }
+  .info-val { color: var(--charcoal); font-weight: 600; text-align: right; }
+  .badge-pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 100px; margin-top: 3px; }
+  .tfd .badge-pill { background: var(--tfd-light); color: var(--tfd-color); }
+  .amata .badge-pill { background: var(--amata-light); color: var(--amata-color); }
+  .bftz .badge-pill { background: var(--bftz-light); color: var(--bftz-color); }
+
+  /* ── TABLE ── */
+  .table-wrap { overflow-x: auto; border-radius: var(--radius); box-shadow: var(--shadow-card); margin-bottom: 8px; }
+  table.compare { width: 100%; border-collapse: collapse; background: var(--warm-white); font-size: 13.5px; }
+  table.compare thead th { padding: 13px 16px; text-align: left; font-weight: 700; font-size: 13px; white-space: nowrap; }
+  table.compare thead th:first-child { background: var(--sand); color: var(--stone-dark); width: 120px; }
+  table.compare thead th.tfd-h { background: var(--tfd-color); color: #fff; }
+  table.compare thead th.amata-h { background: var(--amata-color); color: #fff; }
+  table.compare thead th.bftz-h { background: var(--bftz-color); color: #fff; }
+  table.compare tbody td { padding: 11px 16px; vertical-align: top; border-bottom: 1px solid var(--sand-dark); line-height: 1.65; }
+  table.compare tbody td:first-child { font-weight: 600; color: var(--stone-dark); font-size: 12.5px; background: var(--sand); }
+  table.compare tbody tr:nth-child(even) td { background: #F8F5F0; }
+  table.compare tbody tr:nth-child(even) td:first-child { background: var(--sand); }
+  table.compare tbody tr:last-child td { border-bottom: none; }
+
+  /* ── LOCATION ── */
+  .loc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+  .loc-card { background: var(--warm-white); border-radius: var(--radius); box-shadow: var(--shadow-card); overflow: hidden; }
+  .loc-header { padding: 12px 16px; font-weight: 700; font-size: 13.5px; color: #fff; }
+  .tfd .loc-header { background: var(--tfd-color); }
+  .amata .loc-header { background: var(--amata-color); }
+  .bftz .loc-header { background: var(--bftz-color); }
+  .loc-body { padding: 14px 16px; }
+  .loc-item { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0; border-bottom: 1px solid var(--sand); font-size: 13px; }
+  .loc-item:last-child { border-bottom: none; }
+  .loc-dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 7px; flex-shrink: 0; }
+  .tfd .loc-dot { background: var(--tfd-accent); }
+  .amata .loc-dot { background: var(--amata-accent); }
+  .bftz .loc-dot { background: var(--bftz-accent); }
+  .loc-dest { font-weight: 500; color: var(--charcoal); }
+  .loc-km { font-size: 12px; color: var(--stone); }
+
+  /* ── PROS CONS ── */
+  .pros-cons-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+  .pc-card { background: var(--warm-white); border-radius: var(--radius); box-shadow: var(--shadow-card); overflow: hidden; }
+  .pc-header { padding: 14px 18px; font-size: 14px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; }
+  .tfd .pc-header { background: var(--tfd-color); }
+  .amata .pc-header { background: var(--amata-color); }
+  .bftz .pc-header { background: var(--bftz-color); }
+  .pc-body { padding: 14px 18px; }
+  .pc-section-title {
+    font-size: 12px; font-weight: 700; letter-spacing: 0.8px;
+    margin-bottom: 8px; margin-top: 14px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .pc-section-title:first-child { margin-top: 0; }
+  .pc-section-title.pros { color: var(--pro-green); }
+  .pc-section-title.cons { color: var(--con-red); }
+  .pc-list { list-style: none; display: flex; flex-direction: column; gap: 5px; }
+  .pc-list li { font-size: 13px; padding-left: 20px; position: relative; line-height: 1.6; }
+  .pc-list.pros-list li::before { content: '+'; position: absolute; left: 0; color: var(--pro-green); font-weight: 700; }
+  .pc-list.cons-list li::before { content: '−'; position: absolute; left: 2px; color: var(--con-red); font-weight: 700; }
+  .pc-divider { border: none; border-top: 1px solid var(--sand-dark); margin: 12px 0; }
+
+  /* ── RECOMMENDATION ── */
+  .reco-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .reco-card {
+    background: var(--warm-white); border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-card); padding: 16px 18px;
+    display: flex; gap: 14px; align-items: flex-start;
+    border-left: 4px solid var(--sand-dark); transition: transform 0.18s;
+  }
+  .reco-card:hover { transform: translateX(3px); }
+  .reco-card.tfd-r { border-left-color: var(--tfd-accent); }
+  .reco-card.amata-r { border-left-color: var(--amata-accent); }
+  .reco-card.bftz-r { border-left-color: var(--bftz-accent); }
+  .reco-icon { font-size: 26px; flex-shrink: 0; margin-top: 1px; }
+  .reco-type { font-size: 13px; font-weight: 700; color: var(--charcoal); margin-bottom: 3px; }
+  .reco-park { font-size: 12px; font-weight: 700; margin-bottom: 4px; }
+  .reco-card.tfd-r .reco-park { color: var(--tfd-color); }
+  .reco-card.amata-r .reco-park { color: var(--amata-color); }
+  .reco-card.bftz-r .reco-park { color: var(--bftz-color); }
+  .reco-reason { font-size: 12.5px; color: var(--stone-dark); line-height: 1.6; }
+
+  /* ── CONTACT ── */
+  .contact-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 16px; }
+  .contact-card { background: var(--warm-white); border-radius: var(--radius); box-shadow: var(--shadow-card); overflow: hidden; }
+  .contact-header { padding: 12px 16px; font-weight: 700; font-size: 13px; color: #fff; }
+  .tfd .contact-header { background: var(--tfd-color); }
+  .amata .contact-header { background: var(--amata-color); }
+  .bftz .contact-header { background: var(--bftz-color); }
+  .contact-body { padding: 14px 16px; font-size: 13px; line-height: 1.85; color: var(--stone-dark); }
+  .contact-body b { color: var(--charcoal); }
+
+  /* ── STICKY NAV ── */
+  .sticky-nav {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(250,247,242,0.94); backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--sand-dark); padding: 0 20px;
+  }
+  .sticky-nav ul {
+    list-style: none; display: flex; gap: 0;
+    max-width: 1080px; margin: 0 auto;
+    overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .sticky-nav ul::-webkit-scrollbar { display: none; }
+  .sticky-nav li a {
+    display: block; padding: 13px 15px;
+    font-size: 13px; font-weight: 600; color: var(--stone-dark);
+    text-decoration: none; white-space: nowrap;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .sticky-nav li a:hover { color: var(--sage-dark); border-color: var(--sage-dark); }
+
+  /* ── FADE ── */
+  .fade-in { opacity: 0; transform: translateY(18px); transition: opacity 0.5s ease, transform 0.5s ease; }
+  .fade-in.visible { opacity: 1; transform: translateY(0); }
+
+  /* ── FOOTER ── */
+  .footer {
+    background: var(--charcoal); color: rgba(255,255,255,0.6);
+    padding: 28px 24px; text-align: center;
+    font-size: 12px; line-height: 1.75; margin-top: 48px;
+  }
+
+  @media (max-width: 600px) {
+    .hero { padding: 40px 16px 36px; }
+    .container { padding: 0 14px; }
+    table.compare thead th, table.compare tbody td { padding: 9px 10px; font-size: 12px; }
+    .download-bar { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<!-- DOWNLOAD BAR -->
+<div class="download-bar">
+  <div class="download-bar-text">
+    📥 <span>儲存本頁面以便隨時查閱</span>
+  </div>
+  <div class="download-btn-group">
+    <button class="dl-btn primary" onclick="downloadHTML()">⬇ 下載繁體中文版 (.html)</button>
+  </div>
+</div>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-badge">工業園區比較報告 · 泰國</div>
+  <h1>泰國工業園區綜合比較報告</h1>
+  <p>依據三家園區官方資料，系統比較地理位置、基礎建設、價格及優缺點，協助投資者做出明智決策</p>
+  <div class="park-chips">
+    <span class="park-chip">🏭 TFD工業園區</span>
+    <span class="park-chip">🌿 安美德工業城（春武里／羅勇）</span>
+    <span class="park-chip">📦 曼谷自由貿易區 BFTZ</span>
+  </div>
+</div>
+
+<!-- STICKY NAV -->
+<nav class="sticky-nav">
+  <ul>
+    <li><a href="#overview">總覽</a></li>
+    <li><a href="#location">地理位置</a></li>
+    <li><a href="#infra">基礎建設</a></li>
+    <li><a href="#price">價格條件</a></li>
+    <li><a href="#proscons">優缺點</a></li>
+    <li><a href="#reco">投資建議</a></li>
+    <li><a href="#contact">聯絡方式</a></li>
+  </ul>
+</nav>
+
+<div class="container">
+
+  <!-- SECTION 1: OVERVIEW -->
+  <section class="section fade-in visible" id="overview">
+    <div class="section-title"><span class="num">一</span> 工業園區總覽</div>
+    <hr class="divider">
+    <div class="park-cards">
+
+      <div class="park-card tfd">
+        <div class="park-card-header">
+          <div class="park-icon">🏗️</div>
+          <div>
+            <div class="park-card-name">TFD工業園區</div>
+            <div class="park-card-sub">JCK國際上市公司 · 北柳府</div>
+          </div>
+        </div>
+        <div class="park-card-body">
+          <div class="info-row"><span class="info-label">成立時間</span><span class="info-val">1977年（TFD1：2007年）</span></div>
+          <div class="info-row"><span class="info-label">園區面積</span><span class="info-val">TFD2：833萊 · TFD3：1,230萊</span></div>
+          <div class="info-row"><span class="info-label">認證資質</span><span class="info-val"><span class="badge-pill">IEAT 2016</span> <span class="badge-pill">EIA 2017</span></span></div>
+          <div class="info-row"><span class="info-label">土地售價</span><span class="info-val">1,200萬泰銖／萊</span></div>
+          <div class="info-row"><span class="info-label">營運模式</span><span class="info-val">土地銷售＋一站式服務</span></div>
+        </div>
+      </div>
+
+      <div class="park-card amata">
+        <div class="park-card-header">
+          <div class="park-icon">🌿</div>
+          <div>
+            <div class="park-card-name">安美德工業城</div>
+            <div class="park-card-sub">Amata Corporation PCL · 春武里／羅勇</div>
+          </div>
+        </div>
+        <div class="park-card-body">
+          <div class="info-row"><span class="info-label">成立時間</span><span class="info-val">春武里：1989年 · 羅勇：1995年</span></div>
+          <div class="info-row"><span class="info-label">園區面積</span><span class="info-val">春武里：25,000萊 · 羅勇：17,000萊</span></div>
+          <div class="info-row"><span class="info-label">認證資質</span><span class="info-val"><span class="badge-pill">IEAT</span> <span class="badge-pill">EEC特區</span></span></div>
+          <div class="info-row"><span class="info-label">土地售價</span><span class="info-val">600–1,400萬泰銖／萊</span></div>
+          <div class="info-row"><span class="info-label">進駐企業</span><span class="info-val">800–1,300家以上</span></div>
+        </div>
+      </div>
+
+      <div class="park-card bftz">
+        <div class="park-card-header">
+          <div class="park-icon">📦</div>
+          <div>
+            <div class="park-card-name">曼谷自由貿易區</div>
+            <div class="park-card-sub">Prospect Development Co., Ltd. · 北欖府</div>
+          </div>
+        </div>
+        <div class="park-card-body">
+          <div class="info-row"><span class="info-label">園區面積</span><span class="info-val">1,000萊（160公頃）</span></div>
+          <div class="info-row"><span class="info-label">認證資質</span><span class="info-val"><span class="badge-pill">BOI</span> <span class="badge-pill">自由貿易區</span></span></div>
+          <div class="info-row"><span class="info-label">土地售價</span><span class="info-val">不出售（僅出租）</span></div>
+          <div class="info-row"><span class="info-label">產品類型</span><span class="info-val">4種倉庫／工廠類型</span></div>
+          <div class="info-row"><span class="info-label">核心優勢</span><span class="info-val">免進出口稅，園內通關</span></div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- SECTION 2: LOCATION -->
+  <section class="section fade-in" id="location">
+    <div class="section-title"><span class="num">二</span> 戰略位置與交通距離</div>
+    <hr class="divider">
+    <div class="loc-grid">
+
+      <div class="loc-card tfd">
+        <div class="loc-header">📍 TFD工業園區 — 北柳府（Lat: 13°35'N, Lon: 100°58'E）</div>
+        <div class="loc-body">
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">豐田半坡工廠</div><div class="loc-km">6公里 · 5分鐘</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">素萬那普國際機場</div><div class="loc-km">40公里 · 25分鐘</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">曼谷市中心</div><div class="loc-km">45公里 · 40分鐘</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">曼谷港（孔堤港）</div><div class="loc-km">60公里 · 45分鐘</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">廉差邦深水港</div><div class="loc-km">70公里 · 50分鐘</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">高鐵站（北柳府站）</div><div class="loc-km">僅13公里</div></div></div>
+        </div>
+      </div>
+
+      <div class="loc-card amata">
+        <div class="loc-header">📍 安美德工業城 — 春武里府 ／ 羅勇府</div>
+        <div class="loc-body">
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">曼谷（春武里）</div><div class="loc-km">57公里</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">素萬那普機場（春武里）</div><div class="loc-km">55公里</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">廉差邦深水港（春武里）</div><div class="loc-km">52公里</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">廉差邦深水港（羅勇）</div><div class="loc-km">23公里 ★最近</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">烏達抛機場（羅勇）</div><div class="loc-km">45公里</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">瑪塔普港（羅勇）</div><div class="loc-km">45公里</div></div></div>
+        </div>
+      </div>
+
+      <div class="loc-card bftz">
+        <div class="loc-header">📍 BFTZ — 邦納特拉德公路23公里，北欖府</div>
+        <div class="loc-body">
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">曼谷市中心</div><div class="loc-km">約23公里 ★最近</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">素萬那普國際機場</div><div class="loc-km">鄰近</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">七號高速公路（Motorway）</div><div class="loc-km">直接連通</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">曼谷港（孔堤港）</div><div class="loc-km">鄰近</div></div></div>
+          <div class="loc-item"><div class="loc-dot"></div><div><div class="loc-dest">邦普工業區</div><div class="loc-km">周邊配套</div></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SECTION 3: INFRASTRUCTURE -->
+  <section class="section fade-in" id="infra">
+    <div class="section-title"><span class="num">三</span> 基礎建設與公共事業比較</div>
+    <hr class="divider">
+    <div class="table-wrap">
+      <table class="compare">
+        <thead>
+          <tr>
+            <th>項目</th>
+            <th class="tfd-h">TFD工業園區</th>
+            <th class="amata-h">安美德工業城</th>
+            <th class="bftz-h">曼谷自由貿易區</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>⚡ 電力</td>
+            <td>22KV變電站（PEA）<br>來自挽巴功發電廠 890MW<br>總容量890MVA · 剩餘549MVA</td>
+            <td>PEA 22KV<br>春武里：30kVA／萊<br>羅勇：50kVA／萊<br>（超出需另付1,500泰銖／kVA）</td>
+            <td>大都會電力局（MEA）</td>
+          </tr>
+          <tr>
+            <td>💧 供水</td>
+            <td>40,000立方米／天（UF超濾）<br>≤7立方米／萊／天：<b>25.95泰銖／立方米</b><br>&gt;7立方米／萊／天：35泰銖／立方米</td>
+            <td>≤3立方米／萊／天：<b>25泰銖／立方米</b><br>&gt;3立方米／萊／天：34泰銖／立方米<br>最高供應量：5立方米／萊／天</td>
+            <td>由BFTZ園區提供</td>
+          </tr>
+          <tr>
+            <td>🌊 污水處理</td>
+            <td>20,000立方米／天<br>SBR＋MBR雙系統<br>BOD標準達標排放</td>
+            <td>按供水量80%計算<br>依BOD值IEAT公式計費<br>含超標罰款機制（3–5倍）</td>
+            <td>2,800立方米／天<br>（第二期）</td>
+          </tr>
+          <tr>
+            <td>🛣️ 道路標準</td>
+            <td>主幹道寬<b>35公尺</b><br>次幹道寬<b>30公尺</b></td>
+            <td>符合IEAT標準道路</td>
+            <td>鋼筋混凝土路面<br>淨寬12–15公尺</td>
+          </tr>
+          <tr>
+            <td>📡 通訊網路</td>
+            <td>JASTEL提供5G<br>光纖寬頻網路</td>
+            <td>Amata Network<br>或CAT Telcom</td>
+            <td>TOT提供<br>（電話／ADSL／光纖／ISDN）</td>
+          </tr>
+          <tr>
+            <td>🔥 天然氣</td>
+            <td>PTT天然氣管道<br>（NGV／LNG／LPG）<br><b>管道直接經過園區</b></td>
+            <td>Amata天然氣配送公司<br>另行簽訂合約</td>
+            <td>官方資料未說明</td>
+          </tr>
+          <tr>
+            <td>🛡️ 防洪措施</td>
+            <td>地面高於洪水位<b>+2.7公尺</b><br>4個蓄水池（172,611立方米）<br>備用抽水泵 6,000公升／分鐘</td>
+            <td>羅勇：地勢80–110公尺<br>（天然高地，防洪條件優）<br>春武里：配套防洪體系</td>
+            <td>堤壩＋水庫<br>＋抽水系統</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- SECTION 4: PRICE -->
+  <section class="section fade-in" id="price">
+    <div class="section-title"><span class="num">四</span> 土地價格與投資條件</div>
+    <hr class="divider">
+    <div class="table-wrap">
+      <table class="compare">
+        <thead>
+          <tr>
+            <th>類別</th>
+            <th class="tfd-h">TFD工業園區</th>
+            <th class="amata-h">安美德工業城</th>
+            <th class="bftz-h">曼谷自由貿易區</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>💰 土地售價</td>
+            <td><b>1,200萬泰銖／萊</b>（一般加工區）<br>範例G119地塊：9,810萬泰銖<br>範例G120地塊：1.29億泰銖</td>
+            <td>春武里：<b>1,200萬泰銖／萊</b><br>Amata智慧城：1,400萬泰銖／萊<br>春武里二期：600萬泰銖／萊<br>羅勇：<b>600萬泰銖／萊</b></td>
+            <td>不出售土地<br>（僅提供出租）</td>
+          </tr>
+          <tr>
+            <td>📋 付款方式</td>
+            <td>訂金30%→簽約40%→過戶30%<br>移轉費：買賣雙方各承擔50%</td>
+            <td>按雙邊協議約定</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td>🏢 廠房／倉庫租賃</td>
+            <td>提供定制廠房（可建造）<br>租金詳情未在資料中說明</td>
+            <td><b>230泰銖起／平方公尺／月</b><br>面積：1,000–5,000平方公尺<br>合約期：3年 · 押金4個月</td>
+            <td>4種類型：<br>• 平板倉庫：585平方公尺起<br>• 架高地板倉庫：1,000平方公尺起<br>• 迷你工廠：600平方公尺起<br>• 獨立廠房：1,000平方公尺起</td>
+          </tr>
+          <tr>
+            <td>🎁 BOI稅務優惠</td>
+            <td>BOI＋IEAT一站式申請<br>免機械設備進口關稅<br>企業所得稅減免</td>
+            <td>BOI最高<b>13年</b>免企業所得稅<br>100%外資全資持股<br>EEC特殊政策加持<br>不限外匯匯出</td>
+            <td>BOI免企業所得稅<br><b>自由區：免進出口稅</b><br>免廢料／殘品關稅<br>無需銀行擔保</td>
+          </tr>
+          <tr>
+            <td>🔧 公共區域維護費</td>
+            <td>按IEAT標準收取</td>
+            <td>春武里：1,320泰銖／萊／月<br>羅勇：1,210泰銖／萊／月<br>（2025年價格）</td>
+            <td>含在租金內</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- SECTION 5: PROS CONS -->
+  <section class="section fade-in" id="proscons">
+    <div class="section-title"><span class="num">五</span> 優缺點綜合評析</div>
+    <hr class="divider">
+    <div class="pros-cons-grid">
+
+      <div class="pc-card tfd">
+        <div class="pc-header">🏗️ TFD工業園區</div>
+        <div class="pc-body">
+          <div class="pc-section-title pros">✅ 主要優點</div>
+          <ul class="pc-list pros-list">
+            <li>獲IEAT＋EIA雙重認證（2016／2017年）</li>
+            <li>土地價格合理（1,200萬泰銖／萊）</li>
+            <li>PTT天然氣管道（NGV／LNG／LPG）直接經過</li>
+            <li>IEAT一站式服務（BOI＋簽證＋工作許可）</li>
+            <li>距高鐵站（北柳府）僅13公里</li>
+            <li>防洪措施完善（高於洪水位+2.7公尺）</li>
+            <li>知名客戶：豐田、索尼、BMW、賓士</li>
+            <li>JASTEL 5G通訊網路覆蓋</li>
+          </ul>
+          <hr class="pc-divider">
+          <div class="pc-section-title cons">❌ 主要缺點</div>
+          <ul class="pc-list cons-list">
+            <li>園區面積遠小於安美德</li>
+            <li>不在EEC東部經濟走廊特區範圍內</li>
+            <li>TFD3仍處於開發規劃階段</li>
+            <li>TFD1已售罄</li>
+            <li>距廉差邦港70公里</li>
+            <li>周邊城市配套相對較少</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="pc-card amata">
+        <div class="pc-header">🌿 安美德工業城（春武里／羅勇）</div>
+        <div class="pc-body">
+          <div class="pc-section-title pros">✅ 主要優點</div>
+          <ul class="pc-list pros-list">
+            <li>泰國規模最大的工業園區</li>
+            <li>已獲EEC東部經濟走廊特區正式批准</li>
+            <li>進駐企業800–1,300家以上，勞動力10–19.6萬人</li>
+            <li>提供即用型出租廠房（Rental Factory）</li>
+            <li>羅勇園區地勢80–110公尺，天然防洪</li>
+            <li>BOI最高13年免企業所得稅</li>
+            <li>支援12個EEC目標產業</li>
+            <li>允許100%外資全資持股</li>
+          </ul>
+          <hr class="pc-divider">
+          <div class="pc-section-title cons">❌ 主要缺點</div>
+          <ul class="pc-list cons-list">
+            <li>土地價格較高（600–1,400萬泰銖／萊）</li>
+            <li>距曼谷較遠（57–112公里）</li>
+            <li>須購置土地，初始投資成本較高</li>
+            <li>春武里園區距烏達抛機場97公里</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="pc-card bftz">
+        <div class="pc-header">📦 曼谷自由貿易區（BFTZ）</div>
+        <div class="pc-body">
+          <div class="pc-section-title pros">✅ 主要優點</div>
+          <ul class="pc-list pros-list">
+            <li>距曼谷市中心最近（約23公里）</li>
+            <li>自由區特權：完全免進出口關稅</li>
+            <li>園區內辦理海關清關手續</li>
+            <li>無需提供銀行擔保，改善現金流</li>
+            <li>無需購地，出租模式降低初始投資</li>
+            <li>4種建築類型，靈活適配業務規模</li>
+            <li>適合中小企業（迷你工廠600平方公尺起）</li>
+            <li>周邊住宅區提供5,000戶以上勞動力</li>
+          </ul>
+          <hr class="pc-divider">
+          <div class="pc-section-title cons">❌ 主要缺點</div>
+          <ul class="pc-list cons-list">
+            <li>無土地出售，僅提供出租</li>
+            <li>不屬於EEC東部經濟走廊特區</li>
+            <li>總面積明顯小於TFD和安美德</li>
+            <li>污水處理能力較低（2,800立方米／天）</li>
+          </ul>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- SECTION 6: RECOMMENDATION -->
+  <section class="section fade-in" id="reco">
+    <div class="section-title"><span class="num">六</span> 依業務類型的投資建議</div>
+    <hr class="divider">
+    <div class="reco-grid">
+      <div class="reco-card amata-r">
+        <div class="reco-icon">🚗</div>
+        <div>
+          <div class="reco-type">汽車零組件／電子製造業</div>
+          <div class="reco-park">→ 推薦 安美德春武里工業城</div>
+          <div class="reco-reason">泰國最大汽車產業聚落，供應鏈體系完整，勞動力19.6萬人以上</div>
+        </div>
+      </div>
+      <div class="reco-card bftz-r">
+        <div class="reco-icon">🏪</div>
+        <div>
+          <div class="reco-type">中小企業（SME）／初創投資</div>
+          <div class="reco-park">→ 推薦 BFTZ 或 安美德出租廠房</div>
+          <div class="reco-reason">無需購地，出租啟動，初始投資低，交付快，多規格可選</div>
+        </div>
+      </div>
+      <div class="reco-card bftz-r">
+        <div class="reco-icon">✈️</div>
+        <div>
+          <div class="reco-type">進出口貿易／需免稅優惠</div>
+          <div class="reco-park">→ 推薦 BFTZ（自由貿易區）</div>
+          <div class="reco-reason">自由區完全免進出口關稅，園內海關通關，無需銀行擔保，改善現金流</div>
+        </div>
+      </div>
+      <div class="reco-card amata-r">
+        <div class="reco-icon">⚗️</div>
+        <div>
+          <div class="reco-type">化工／石化／重工業</div>
+          <div class="reco-park">→ 推薦 安美德羅勇工業城</div>
+          <div class="reco-reason">距瑪塔普港45公里，地勢高80–110公尺天然防洪，EEC特區全面支援</div>
+        </div>
+      </div>
+      <div class="reco-card tfd-r">
+        <div class="reco-icon">⛽</div>
+        <div>
+          <div class="reco-type">需要天然氣／毗鄰汽車廠</div>
+          <div class="reco-park">→ 推薦 TFD工業園區</div>
+          <div class="reco-reason">PTT天然氣管道（NGV／LNG／LPG）直接經過，緊鄰豐田半坡工廠僅6公里</div>
+        </div>
+      </div>
+      <div class="reco-card amata-r">
+        <div class="reco-icon">🌟</div>
+        <div>
+          <div class="reco-type">申請EEC最大優惠政策</div>
+          <div class="reco-park">→ 推薦 安美德工業城（春武里／羅勇）</div>
+          <div class="reco-reason">EEC已批准，BOI最高13年免企業所得稅，12個目標產業優惠，100%外資</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SECTION 7: CONTACT -->
+  <section class="section fade-in" id="contact">
+    <div class="section-title"><span class="num">七</span> 聯絡方式</div>
+    <hr class="divider">
+    <div class="contact-grid">
+
+      <div class="contact-card tfd">
+        <div class="contact-header">🏗️ TFD工業園區 — JCK International PCL</div>
+        <div class="contact-body">
+          <b>📧 電子郵件：</b>industrial@jck.international<br>
+          <b>🌐 官方網站：</b>www.tfd-factory.com<br>
+          <b>💬 WeChat：</b>TAN · AOT · FAI<br>
+          <b>📱 LINE：</b>TAN · AOT · FAI
+        </div>
+      </div>
+
+      <div class="contact-card amata">
+        <div class="contact-header">🌿 安美德工業城 — Amata Corporation PCL</div>
+        <div class="contact-body">
+          <b>徐根羅 / Xu Genluo</b>（中國市場VP）<br>
+          📱 Mobile：+66 81 921 6681<br>
+          📧 genluo.xu@amata.com<br><br>
+          <b>陳曉佳 / Pimpaer</b>（業務執行）<br>
+          📱 Mobile：+66 89 224 0007<br>
+          📧 pimpaer@amata.com<br>
+          💬 WeChat：Pimpaer2012
+        </div>
+      </div>
+
+      <div class="contact-card bftz">
+        <div class="contact-header">📦 曼谷自由貿易區 — Prospect Development Co., Ltd.</div>
+        <div class="contact-body">
+          <b>總部：</b>345 Thanon Surawong, Bang Rak, Bangkok 10500<br>
+          <b>現場辦公室：</b>1040/1 Moo 15 Bangsaothong, Samutprakarn 10570<br>
+          📞 (66)61 856 9779 · (66)2 697 3738<br>
+          📧 info@prospectd.com<br>
+          🌐 www.bangkokfreetradezone.com
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+</div><!-- /container -->
+
+<div class="footer">
+  <p><b>免責聲明：</b>本報告所有資料均來源於各園區官方文件，包括：TFD工業園區簡報（JCK International PCL）、安美德集團宣傳冊（2025年1月版）及曼谷自由貿易區宣傳手冊（BFTZ1 / Prospect Development Co., Ltd.）</p>
+  <p style="margin-top:8px">價格及條件可能隨時變更，請直接聯絡相關園區取得最新資訊。</p>
+  <p style="margin-top:8px;opacity:0.45">© 2025 Industrial Estate Comparison Report · Thailand · 繁體中文版</p>
+</div>
+
+<script>
+  // Scroll fade-in
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); });
+  }, { threshold: 0.08 });
+  document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+
+  // Download current page as HTML file
+  function downloadHTML() {
+    const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '泰國工業園區綜合比較_繁體中文版.html';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+</script>
+
+
+</body></html>
